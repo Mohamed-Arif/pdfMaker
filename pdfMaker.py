@@ -7,9 +7,18 @@ import os
 
 # Compression function
 def compress_and_convert(image_path, output_path, quality=85):
-    img = Image.open(image_path)
+    try:
+        img = Image.open(image_path)
+    except FileNotFoundError:
+        print(f"File not found: {image_path}")
+        return None  # Return None if the file is not found
+    except IOError:
+        print(f"Cannot open file: {image_path}")
+        return None  # Return None if there's an IOError
+
     img = img.convert("RGB")
     img.save(output_path, "JPEG", quality=quality, optimize=True)
+    return output_path
 
 
 # PDF conversion function
