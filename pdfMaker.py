@@ -22,6 +22,23 @@ def compress_and_convert(image_path, output_path, quality=85):
     return output_path
 
 
+# Image processing function
+def process_image(image_file, source_folder, max_width, max_height):
+    compressed_image = os.path.join(source_folder, "compressed_" + image_file)
+    compressed_image_path = compress_and_convert(os.path.join(source_folder, image_file), compressed_image)
+
+    if compressed_image_path is None:
+        return None, None  # Skip this image if it couldn't be processed
+
+    img = Image.open(compressed_image_path)
+    img_width, img_height = img.size
+    aspect_ratio = min(max_width / img_width, max_height / img_height)
+    new_width = int(img_width * aspect_ratio)
+    new_height = int(img_height * aspect_ratio)
+    resized_img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+    return resized_img, compressed_image_path
+
+
 # PDF conversion function
 def images_to_pdf(source_folder, output_pdf, page_size=letter, max_workers=4):
     image_files = [f for f in os.listdir(source_folder) if f.lower().endswith(('png', 'jpg', 'jpeg', 'bmp', 'gif'))]
@@ -32,33 +49,30 @@ def images_to_pdf(source_folder, output_pdf, page_size=letter, max_workers=4):
 
     # Using ThreadPoolExecutor for concurrency
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = []
-        for image_file in image_files:
-            compressed_image = os.path.join(source_folder, "compressed_" + image_file)
-            future = executor.submit(compress_and_convert, os.path.join(source_folder, image_file), compressed_image)
-            futures.append((future, compressed_image))
+        future_to_image = {
+            executor.submit(process_image, image_file, source_folder, max_width, max_height): image_file
+            for image_file in image_files
+        }
 
-        for future, compressed_image_path in futures:
-            result = future.result()
-            if result is None:
-                continue  # Skip this image if it couldn't be processed
-
-            img = Image.open(compressed_image_path)
-            img_width, img_height = img.size
-            aspect_ratio = min(max_width / img_width, max_height / img_height)
-            new_width = int(img_width * aspect_ratio)
-            new_height = int(img_height * aspect_ratio)
-            resized_img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-
-            c.drawImage(compressed_image_path, 0, 0, width=new_width, height=new_height)
-            c.showPage()
-
-            # Cleanup: Delete the compressed image after it has been added to the PDF
+        for future in concurrent.futures.as_completed(future_to_image):
+            image_file = future_to_image[future]
             try:
-                os.remove(compressed_image_path)
-                print(f"Deleted temporary file: {compressed_image_path}")
-            except Exception as e:
-                print(f"Error deleting file {compressed_image_path}: {e}")
+                resized_img, compressed_image = future.result()
+                if resized_img is None or compressed_image is None:
+                    continue  # Skip this image if it couldn't be processed
+
+                c.drawImage(compressed_image, 0, 0, width=resized_img.width, height=resized_img.height)
+                c.showPage()
+
+                # Cleanup: Delete the compressed image after it has been added to the PDF
+                try:
+                    os.remove(compressed_image)
+                    print(f"Deleted temporary file: {compressed_image}")
+                except Exception as e:
+                    print(f"Error deleting file {compressed_image}: {e}")
+
+            except Exception as exc:
+                print(f"Error processing {image_file}: {exc}")
 
     c.save()
 
