@@ -1,4 +1,4 @@
-# noinspection PyInterpreter
+# noinspection PyInterpreter huh?
 from PIL import Image
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter, A4
