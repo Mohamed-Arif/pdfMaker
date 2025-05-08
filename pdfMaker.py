@@ -1,83 +1,157 @@
-# noinspection PyInterpreter huh?
-from PIL import Image
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import letter, A4
 import os
-import concurrent.futures
+import logging
+import tempfile
+from pathlib import Path
+from typing import List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from PIL import Image
+from reportlab.lib.pagesizes import letter, A4
+from reportlab.lib.utils import ImageReader
+from reportlab.pdfgen import canvas
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# Constants
+DEFAULT_QUALITY = 85
+SUPPORTED_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tiff")
 
 
-# Compression function
-def compress_and_convert(image_path, output_path, quality=85):
-    try:
-        img = Image.open(image_path)
-    except FileNotFoundError:
-        print(f"File not found: {image_path}")
-        return None  # Return None if the file is not found
-    except IOError:
-        print(f"Cannot open file: {image_path}")
-        return None  # Return None if there's an IOError
+class PDFGenerator:
+    def __init__(
+            self,
+            source_folder: str,
+            output_pdf: str,
+            page_size: Tuple[float, float] = letter,
+            image_quality: int = DEFAULT_QUALITY,
+            max_workers: int = 4,
+            dpi: int = 300,
+    ):
+        self.source_folder = Path(source_folder)
+        self.output_pdf = Path(output_pdf)
+        self.page_size = page_size
+        self.quality = image_quality
+        self.max_workers = max_workers
+        self.dpi = dpi
 
-    img = img.convert("RGB")
-    img.save(output_path, "JPEG", quality=quality, optimize=True)
-    return output_path
+    def validate_inputs(self) -> None:
+        """Ensure source folder exists and output directory is writable."""
+        if not self.source_folder.exists():
+            raise FileNotFoundError(f"Source folder not found: {self.source_folder}")
+        if not self.source_folder.is_dir():
+            raise NotADirectoryError(f"Not a directory: {self.source_folder}")
 
+        output_dir = self.output_pdf.parent
+        if not output_dir.exists():
+            output_dir.mkdir(parents=True, exist_ok=True)
+        if not os.access(output_dir, os.W_OK):
+            raise PermissionError(f"Cannot write to: {output_dir}")
 
-# Image processing function
-def process_image(image_file, source_folder, max_width, max_height):
-    compressed_image = os.path.join(source_folder, "compressed_" + image_file)
-    compressed_image_path = compress_and_convert(os.path.join(source_folder, image_file), compressed_image)
+    def get_sorted_images(self) -> List[Path]:
+        """Return supported images sorted by name."""
+        images = [
+            f for f in self.source_folder.iterdir()
+            if f.suffix.lower() in SUPPORTED_EXTENSIONS
+        ]
+        return sorted(images, key=lambda x: x.name.lower())
 
-    if compressed_image_path is None:
-        return None, None  # Skip this image if it couldn't be processed
+    def process_image(self, image_path: Path) -> Optional[Tuple[ImageReader, Path]]:
+        """Resize, compress, and convert image to PDF-compatible format."""
+        try:
+            with Image.open(image_path) as img:
+                # Convert to RGB if necessary (e.g., PNG transparency)
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
 
-    img = Image.open(compressed_image_path)
-    img_width, img_height = img.size
-    aspect_ratio = min(max_width / img_width, max_height / img_height)
-    new_width = int(img_width * aspect_ratio)
-    new_height = int(img_height * aspect_ratio)
-    resized_img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-    return resized_img, compressed_image_path
+                # Calculate scaling while maintaining aspect ratio
+                width, height = img.size
+                max_width, max_height = self.page_size
+                scale = min(max_width / width, max_height / height)
+                new_size = (int(width * scale), int(height * scale))
 
+                # High-quality downscaling
+                img = img.resize(new_size, Image.Resampling.LANCZOS)
 
-# PDF conversion function
-def images_to_pdf(source_folder, output_pdf, page_size=letter, max_workers=4):
-    image_files = [f for f in os.listdir(source_folder) if f.lower().endswith(('png', 'jpg', 'jpeg', 'bmp', 'gif'))]
-    image_files.sort()
+                # Save as temporary JPEG
+                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+                    img.save(tmp.name, "JPEG", quality=self.quality, optimize=True)
+                    return ImageReader(tmp.name), Path(tmp.name)
 
-    c = canvas.Canvas(output_pdf, pagesize=page_size)
-    max_width, max_height = page_size
+        except Exception as e:
+            logger.error(f"Failed to process {image_path.name}: {str(e)}")
+            return None
 
-    # Using ThreadPoolExecutor for concurrency
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_image = {
-            executor.submit(process_image, image_file, source_folder, max_width, max_height): image_file
-            for image_file in image_files
-        }
+    def generate_pdf(self) -> None:
+        """Convert images to a single PDF file."""
+        self.validate_inputs()
+        images = self.get_sorted_images()
 
-        for future in concurrent.futures.as_completed(future_to_image):
-            image_file = future_to_image[future]
-            try:
-                resized_img, compressed_image = future.result()
-                if resized_img is None or compressed_image is None:
-                    continue  # Skip this image if it couldn't be processed
+        if not images:
+            logger.warning("No supported images found in the source folder!")
+            return
 
-                c.drawImage(compressed_image, 0, 0, width=resized_img.width, height=resized_img.height)
-                c.showPage()
+        logger.info(f"Processing {len(images)} images into {self.output_pdf}...")
 
-                # Cleanup: Delete the compressed image after it has been added to the PDF
+        c = canvas.Canvas(str(self.output_pdf), pagesize=self.page_size)
+        temp_files = []
+
+        try:
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                futures = {
+                    executor.submit(self.process_image, img): img
+                    for img in images
+                }
+
+                for future in as_completed(futures):
+                    img_path = futures[future]
+                    try:
+                        result = future.result()
+                        if result is None:
+                            continue  # Skip failed images
+
+                        img_reader, tmp_path = result
+                        temp_files.append(tmp_path)
+
+                        # Draw image on PDF
+                        c.drawImage(
+                            img_reader,
+                            0, 0,
+                            width=self.page_size[0],
+                            height=self.page_size[1],
+                            preserveAspectRatio=True,
+                            mask="auto",
+                        )
+                        c.showPage()
+                        logger.info(f"Added: {img_path.name}")
+
+                    except Exception as e:
+                        logger.error(f"Error adding {img_path.name}: {str(e)}")
+
+            c.save()
+            logger.info(f"PDF successfully generated: {self.output_pdf}")
+
+        finally:
+            # Clean up temporary files
+            for tmp in temp_files:
                 try:
-                    os.remove(compressed_image)
-                    print(f"Deleted temporary file: {compressed_image}")
+                    tmp.unlink()
                 except Exception as e:
-                    print(f"Error deleting file {compressed_image}: {e}")
-
-            except Exception as exc:
-                print(f"Error processing {image_file}: {exc}")
-
-    c.save()
+                    logger.warning(f"Failed to delete {tmp}: {str(e)}")
 
 
-# Example usage
-source_folder = "C://Users//Arif1//Pictures//Camera Roll"
-output_pdf = "output_file.pdf"
-images_to_pdf(source_folder, output_pdf, page_size=letter, max_workers=4)  # or use page_size=A4
+if __name__ == "__main__":
+    # Example Usage
+    generator = PDFGenerator(
+        source_folder="C:/Users/Arif1/Pictures/New Folder",
+        output_pdf="output.pdf",
+        page_size=A4,  # or letter
+        image_quality=90,  # Higher quality
+        max_workers=6,  # More threads for faster processing
+        dpi=300,  # High DPI for print-ready PDFs
+    )
+    generator.generate_pdf()
